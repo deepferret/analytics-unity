@@ -1,0 +1,35 @@
+{
+  "name": "com.dataferret.analytics",
+  "version": "0.1.0",
+  "displayName": "DataFerret Analytics",
+  "description": "Event analytics SDK for Unity games. Track player behavior, sessions, errors, and performance with automatic collection. Integrates with DataFerret platform for AI-powered analysis.",
+  "unity": "2021.3",
+  "unityRelease": "0f1",
+  "documentationUrl": "https://docs.dataferret.io/sdk/unity",
+  "changelogUrl": "https://github.com/dataferret/analytics-unity/blob/main/CHANGELOG.md",
+  "licensesUrl": "https://github.com/dataferret/analytics-unity/blob/main/LICENSE",
+  "dependencies": {
+    "com.unity.nuget.newtonsoft-json": "3.2.1"
+  },
+  "keywords": [
+    "analytics",
+    "events",
+    "tracking",
+    "dataferret",
+    "telemetry",
+    "session",
+    "retention"
+  ],
+  "author": {
+    "name": "CookApps",
+    "email": "sdk@dataferret.io",
+    "url": "https://dataferret.io"
+  },
+  "samples": [
+    {
+      "displayName": "Basic Usage",
+      "description": "Basic event tracking example scene with initialization, identify, track, and screen calls.",
+      "path": "Samples~/BasicUsage"
+    }
+  ]
+}

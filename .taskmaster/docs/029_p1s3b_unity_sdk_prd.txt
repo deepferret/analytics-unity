@@ -1,0 +1,1877 @@
+# PRD: Phase 1 Sprint 3B — Unity SDK (com.dataferret.analytics)
+
+## 1. 개요
+
+### 1.1 목적
+
+Unity 게임 스튜디오를 위한 네이티브 분석 SDK C# 패키지(`com.dataferret.analytics`)를 구현한다.
+게임은 이벤트 기반 분석이 핵심이다 — 플레이어 행동 퍼널, 리텐션 측정, 인앱 결제 추적, A/B 테스트가 게임 비즈니스를 좌우한다.
+기존 솔루션(Unity Analytics, GameAnalytics)은 범용 분석 플랫폼과 분리되어 있어 커스텀 분석이 어렵다.
+
+**문제**: 게임 스튜디오는 이벤트 수집 SDK와 분석 플랫폼이 별개여서 데이터를 이중으로 관리해야 한다.
+비기술 담당자가 게임 이벤트를 자유롭게 쿼리하거나 AI 기반 자동 분석을 활용하기 어렵다.
+
+**해결**: Unity SDK가 이벤트를 수집하여 DataFerret Collector API로 전송하면, 기존 AI Chat, 대시보드, 이상 탐지 기능을 즉시 활용할 수 있다.
+"게임 이벤트 수집 → AI 기반 자동 분석"을 하나의 플랫폼에서 제공하는 솔루션이 된다.
+
+**4가지 핵심 제공 가치**:
+- **멀티플랫폼 단일 SDK**: Unity 하나로 Android, iOS, WebGL, Windows, macOS, Linux 모두 커버
+- **게임 도메인 특화 자동 수집**: 세션, 씬 전환, 에러, 성능 샘플 자동 추적
+- **GC Allocation 최적화**: 게임 런타임 성능을 해치지 않도록 Track() 1회 < 1KB GC Alloc 목표
+- **UPM 배포**: Unity Package Manager(Git URL) + OpenUPM 레지스트리로 5분 내 설치 가능
+
+**CookApps 전략적 포지셔닝**: CookApps의 게임 도메인 노하우를 활용하여 게임 분석 시장에서
+차별화된 진입점 확보. 자사 게임에도 즉시 적용 가능.
+
+**관련 기획서**: `docs/plans/data-pipeline/001_sdk_design.md` (Section 5), `docs/plans/data-pipeline/009_implementation_roadmap.md`
+
+### 1.2 현재 상태
+
+#### 이미 구현된 것
+
+- **Collector API**: `apps/backend/src/collector/` — POST /v1/collect/batch 엔드포인트, Write Key 인증
+- **Write Key 시스템**: `ApiKeyService` 확장 — `event:write` 권한, `wk_` 접두사 지원
+- **PostgreSQL 큐**: `raw_events` 테이블 — 수집 버퍼 (7일 TTL), 중복 제거 (UNIQUE constraint)
+- **배치 프로세서**: 5분 Cron → raw_events → Parquet 변환 → S3 업로드
+- **EventEnvelope 규격**: `context.game` 객체 포함, Unity SDK Context 처리 로직 Collector에 반영
+- **이벤트 브라우저**: library.name으로 SDK 타입 필터 지원 (Unity SDK 이벤트 구분 가능)
+
+#### 없는 것
+
+- Unity C# SDK 패키지 (`com.dataferret.analytics`) — 코드 전무
+- UPM 배포 설정 (package.json, .asmdef 파일, Git 레포지토리)
+- Editor 통합 (DataFerretEditorWindow, BuildProcessor)
+- WebGL JavaScript Bridge (.jslib 파일)
+- 크로스플랫폼 빌드 검증 (Android/iOS/WebGL/PC)
+- Unity Test Framework 기반 테스트 (EditMode + PlayMode)
+- OpenUPM 레지스트리 등록
+
+### 1.3 기술 스택
+
+- **언어**: C# (.NET Standard 2.1, Unity 2021.3 LTS 이상)
+- **직렬화**: Newtonsoft.Json for Unity (`com.unity.nuget.newtonsoft-json` 3.2.1)
+- **HTTP**: UnityWebRequest (코루틴 기반, 모든 플랫폼 호환)
+- **WebGL 전송**: .jslib JavaScript 브릿지 → fetch() / sendBeacon()
+- **큐**: System.Collections.Concurrent.ConcurrentQueue<T> (스레드 안전)
+- **영속화**: System.IO.File (.jsonl) / PlayerPrefs (WebGL 폴백)
+- **MonoBehaviour**: FlushScheduler — DontDestroyOnLoad 싱글톤
+- **테스팅**: NUnit (Unity Test Framework), EditMode + PlayMode 양쪽 지원
+- **에디터**: UnityEditor API (EditorWindow, IPreprocessBuild)
+- **배포**: UPM (Unity Package Manager) Git URL + OpenUPM 레지스트리
+
+### 1.4 의존성
+
+**신규 Unity 패키지 1개 추가**:
+- `com.unity.nuget.newtonsoft-json` 3.2.1 (Newtonsoft.Json Unity 포팅 버전)
+
+**백엔드 의존성** (이미 구현됨):
+- Sprint 1-1: Write Key 시스템 (`wk_` 접두사, `event:write` 권한)
+- Sprint 1-2: Collector API (`POST /v1/collect/batch`, CollectorGuard, EventValidatorService)
+
+**최소 Unity 버전**: 2021.3 LTS
+
+**지원 플랫폼**: Android, iOS, WebGL, Windows, macOS, Linux
+
+---
+
+## 2. 아키텍처
+
+### 2.1 패키지 구조
+
+```
+com.dataferret.analytics/
+├── package.json
+├── README.md
+├── CHANGELOG.md
+├── LICENSE
+├── Runtime/
+│   ├── DataFerret.Analytics.asmdef
+│   ├── DataFerretAnalytics.cs         (Static facade - main entry point)
+│   ├── DataFerretConfig.cs            (Configuration ScriptableObject)
+│   ├── Core/
+│   │   ├── EventBuilder.cs            (EventEnvelope construction)
+│   │   ├── EventEnvelope.cs           (Data class)
+│   │   ├── EventContext.cs            (Context data class)
+│   │   ├── EventType.cs               (Enum)
+│   │   └── IdentityManager.cs         (userId, anonymousId management)
+│   ├── Queue/
+│   │   ├── EventQueue.cs              (ConcurrentQueue<T> wrapper)
+│   │   ├── FilePersistence.cs         (.jsonl file queue)
+│   │   └── WebGLPersistence.cs        (PlayerPrefs/IndexedDB)
+│   ├── Transport/
+│   │   ├── ITransport.cs              (Interface)
+│   │   ├── UnityWebRequestTransport.cs (Coroutine-based)
+│   │   └── WebGLTransport.cs          (.jslib bridge)
+│   ├── Lifecycle/
+│   │   ├── FlushScheduler.cs          (MonoBehaviour, DontDestroyOnLoad)
+│   │   ├── SessionTracker.cs          (Session start/end, background detection)
+│   │   ├── SceneTracker.cs            (Scene change auto-tracking)
+│   │   ├── LifecycleTracker.cs        (App pause/resume/quit)
+│   │   └── ErrorTracker.cs            (Application.logMessageReceived)
+│   ├── Platform/
+│   │   ├── PlatformInfo.cs            (SystemInfo wrapper)
+│   │   └── WebGLBridge.cs             (JS interop declarations)
+│   └── Plugins/
+│       └── WebGL/
+│           └── DataFerretBridge.jslib (JavaScript interop for WebGL)
+├── Editor/
+│   ├── DataFerret.Analytics.Editor.asmdef
+│   ├── DataFerretEditorWindow.cs      (Window > DataFerret Analytics)
+│   └── BuildProcessor.cs             (Write Key validation on build)
+├── Tests/
+│   ├── EditMode/
+│   │   ├── DataFerret.Analytics.Tests.EditMode.asmdef
+│   │   ├── EventBuilderTests.cs
+│   │   ├── EventQueueTests.cs
+│   │   ├── IdentityManagerTests.cs
+│   │   ├── PlatformInfoTests.cs
+│   │   ├── FilePersistenceTests.cs
+│   │   └── ConfigTests.cs
+│   └── PlayMode/
+│       ├── DataFerret.Analytics.Tests.PlayMode.asmdef
+│       ├── FlushSchedulerTests.cs
+│       ├── SessionTrackerTests.cs
+│       ├── SceneTrackerTests.cs
+│       ├── TransportTests.cs
+│       └── IntegrationTests.cs
+└── Samples~/
+    └── BasicUsage/
+        ├── SampleScene.unity
+        └── SampleTracker.cs
+```
+
+### 2.2 아키텍처 다이어그램
+
+```
+Game Code (MonoBehaviour)
+    │
+    ▼
+DataFerretAnalytics (static facade)
+    │
+    ├─ EventBuilder.BuildTrack() / BuildIdentify() / BuildScreen() / BuildGroup()
+    │       └─ EventEnvelope 생성 (eventId=UUID v7, timestamp, context 자동 수집)
+    │
+    ▼
+EventQueue (ConcurrentQueue<EventEnvelope>)
+    │   • MaxQueueSize = 1000 (초과 시 oldest drop)
+    │   • Thread-safe 읽기/쓰기
+    │
+    ▼
+FlushScheduler (MonoBehaviour, DontDestroyOnLoad)
+    │   • Update() 루프: flushInterval 경과 시 flush
+    │   • OnApplicationPause(true): 즉시 flush
+    │   • OnApplicationQuit(): 동기 flush
+    │
+    ├─ [Normal] UnityWebRequestTransport (Coroutine)
+    │       └─ POST /v1/collect/batch
+    │           Authorization: Bearer {writeKey}
+    │           Retry: 지수 백오프 (1s → 2s → 4s), max 3회
+    │
+    └─ [WebGL] WebGLTransport (.jslib bridge)
+            └─ JavaScript fetch() / sendBeacon()
+                (브라우저 네이티브 HTTP, CORS 준수)
+
+전송 실패 시:
+    └─ FilePersistence: .jsonl 파일에 append
+           저장 경로: Application.persistentDataPath/dataferret/
+           최대 크기: 5MB
+    └─ WebGLPersistence: PlayerPrefs fallback (WebGL, 1MB 제한)
+
+다음 Init() 시:
+    └─ FilePersistence.Load() → queue에 merge → 재전송
+```
+
+**자동 수집 흐름**:
+```
+SessionTracker
+    OnApplicationPause(false) / Init() → track('session_start')
+    OnApplicationPause(true) + 30분 경과 / OnApplicationQuit() → track('session_end')
+
+SceneTracker
+    SceneManager.sceneLoaded → screen(sceneName, { previous_scene, load_time })
+
+LifecycleTracker
+    OnApplicationPause(true)  → track('app_backgrounded')
+    OnApplicationPause(false) → track('app_foregrounded')
+
+ErrorTracker
+    Application.logMessageReceived (LogType.Exception / Error)
+    → track('error_occurred', { message, stackTrace(1000자), logType })
+    동일 메시지 60초 내 dedup 처리
+
+PerformanceTracker (opt-in)
+    InvokeRepeating 30초 → track('performance_sample', { fps, memory_used, mono_heap })
+```
+
+### 2.3 플랫폼별 구현 차이
+
+| 기능 | Android / iOS / PC | WebGL |
+|------|--------------------|-------|
+| HTTP 전송 | `UnityWebRequest` (코루틴) | `.jslib` → `fetch()` / `sendBeacon()` |
+| 오프라인 큐 영속화 | `.jsonl` 파일 (`Application.persistentDataPath`) | `PlayerPrefs` (1MB 제한) |
+| 백그라운드 스레드 | 가능 (System.Threading) | 불가 (메인 스레드 전용) |
+| CORS | 해당 없음 (브라우저 아님) | 필수 (Write Key allowedOrigins 등록) |
+| 파일 시스템 | `System.IO.File` 직접 사용 | 미지원 (IndexedDB는 Phase 2) |
+| 앱 종료 감지 | `OnApplicationQuit()` | `visibilitychange` → `sendBeacon` |
+
+---
+
+## 3. Core API 설계 (C#)
+
+### 3.1 DataFerretAnalytics — Static Facade
+
+```csharp
+using DataFerret.Analytics;
+
+public static class DataFerretAnalytics
+{
+    // === 초기화 ===
+    public static void Init(DataFerretConfig config);
+
+    // === 이벤트 추적 ===
+    public static void Track(string eventName,
+                             Dictionary<string, object> properties = null);
+
+    // === 유저 식별 ===
+    public static void Identify(string userId,
+                                Dictionary<string, object> traits = null);
+
+    // === 화면(씬) 전환 ===
+    public static void Screen(string screenName,
+                              Dictionary<string, object> properties = null);
+
+    // === 그룹 소속 ===
+    public static void Group(string groupId,
+                             Dictionary<string, object> traits = null);
+
+    // === 글로벌 프로퍼티 (모든 이벤트에 자동 병합) ===
+    public static void SetGlobalProperties(Dictionary<string, object> properties);
+
+    // === 유틸리티 ===
+    public static void Reset();    // 로그아웃 시 userId + anonymousId 초기화
+    public static void Flush();    // 즉시 전송 (씬 전환, 결제 직후 등)
+
+    // === 상태 조회 ===
+    public static bool IsInitialized { get; }
+    public static string AnonymousId { get; }
+    public static string UserId { get; }
+}
+```
+
+### 3.2 DataFerretConfig — 설정 클래스
+
+```csharp
+[System.Serializable]
+public class DataFerretConfig
+{
+    // === 필수 ===
+    public string WriteKey;                                  // wk_ 접두사 필수
+
+    // === 선택: 서버 설정 ===
+    public string ApiHost = "https://collect.dataferret.io";
+
+    // === 선택: 배치 및 플러시 ===
+    public int FlushSize = 20;                               // 이 건수 이상 시 즉시 flush
+    public float FlushIntervalSeconds = 30f;                 // 주기적 flush 간격 (초)
+    public int MaxQueueSize = 1000;                          // 큐 최대 크기 (초과 시 oldest drop)
+    public int MaxRetries = 3;                               // HTTP 재시도 최대 횟수
+    public int TimeoutSeconds = 10;                          // HTTP 타임아웃 (초)
+
+    // === 선택: 디버그 ===
+    public bool Debug = false;                               // true 시 UnityEngine.Debug.Log 출력
+
+    // === 선택: 자동 수집 ===
+    public AutoCaptureConfig AutoCapture = new AutoCaptureConfig();
+
+    [System.Serializable]
+    public class AutoCaptureConfig
+    {
+        public bool Sessions = true;            // session_start / session_end
+        public bool SceneChanges = true;        // screen(sceneName) on SceneManager.sceneLoaded
+        public bool Errors = true;              // error_occurred on LogType.Exception/Error
+        public bool Lifecycle = true;           // app_backgrounded / app_foregrounded
+        public bool PerformanceSamples = false; // opt-in: fps, memory_used (30초 간격)
+    }
+}
+```
+
+### 3.3 사용 예시
+
+```csharp
+// === 초기화 (게임 시작 MonoBehaviour Awake 또는 Start) ===
+void Awake()
+{
+    DataFerretAnalytics.Init(new DataFerretConfig
+    {
+        WriteKey = "wk_proj_abc123",
+        FlushIntervalSeconds = 30f,
+        FlushSize = 20,
+        AutoCapture = new DataFerretConfig.AutoCaptureConfig
+        {
+            Sessions = true,
+            SceneChanges = true,
+            Errors = true,
+            Lifecycle = true,
+            PerformanceSamples = false,
+        },
+    });
+
+    // 글로벌 프로퍼티: 모든 이벤트에 자동 추가
+    DataFerretAnalytics.SetGlobalProperties(new Dictionary<string, object>
+    {
+        { "appVersion", Application.version },
+        { "abGroup", "variant_b" },
+    });
+}
+
+// === 유저 로그인 시 식별 ===
+DataFerretAnalytics.Identify("user_123", new Dictionary<string, object>
+{
+    { "name", "Player One" },
+    { "level", 25 },
+    { "vipTier", "gold" },
+});
+
+// === 스테이지 클리어 이벤트 ===
+DataFerretAnalytics.Track("stage_cleared", new Dictionary<string, object>
+{
+    { "stage_id", 42 },
+    { "time_spent", 125.3f },
+    { "stars", 3 },
+    { "retry_count", 2 },
+});
+
+// === 인앱 결제 ===
+DataFerretAnalytics.Track("purchase_completed", new Dictionary<string, object>
+{
+    { "product_id", "gem_pack_100" },
+    { "amount", 4900 },
+    { "currency", "KRW" },
+    { "store", "google_play" },
+    { "transaction_id", "GPA.1234-5678" },
+});
+
+// === 씬 전환 직전 즉시 flush ===
+DataFerretAnalytics.Flush();
+
+// === 로그아웃 ===
+DataFerretAnalytics.Reset();
+```
+
+---
+
+## 4. 이벤트 큐 (C#)
+
+### 4.1 EventQueue — ConcurrentQueue 래퍼
+
+```csharp
+public class EventQueue
+{
+    private readonly ConcurrentQueue<EventEnvelope> _queue;
+    private readonly int _maxSize;
+
+    public EventQueue(int maxSize = 1000)
+    {
+        _queue = new ConcurrentQueue<EventEnvelope>();
+        _maxSize = maxSize;
+    }
+
+    public void Enqueue(EventEnvelope envelope)
+    {
+        // 최대 크기 초과 시 oldest drop
+        while (_queue.Count >= _maxSize)
+        {
+            _queue.TryDequeue(out _);
+            if (DataFerretAnalytics.Config?.Debug == true)
+            {
+                UnityEngine.Debug.LogWarning("[DataFerret] Queue full, dropping oldest event.");
+            }
+        }
+        _queue.Enqueue(envelope);
+    }
+
+    // 최대 batchSize 건 디큐 (한 번의 flush에 최대 500건)
+    public List<EventEnvelope> DequeueBatch(int batchSize = 500)
+    {
+        var batch = new List<EventEnvelope>(batchSize);
+        while (batch.Count < batchSize && _queue.TryDequeue(out var item))
+        {
+            batch.Add(item);
+        }
+        return batch;
+    }
+
+    public int Count => _queue.Count;
+    public bool IsEmpty => _queue.IsEmpty;
+}
+```
+
+**설계 원칙**:
+- 스레드 안전: `ConcurrentQueue<T>` 사용 (Enqueue는 게임 메인 스레드, Dequeue는 플러시 타이밍)
+- 최대 크기 1000건 (설정으로 변경 가능)
+- 초과 시 가장 오래된 이벤트 drop + 경고 로그 (Debug 모드)
+- 한 번의 flush에 최대 500건 (배치 요청 크기 제한 대응)
+
+### 4.2 FilePersistence — .jsonl 영속화
+
+```csharp
+public class FilePersistence
+{
+    private readonly string _directory;
+    private readonly long _maxTotalBytes;      // 기본 5MB
+    private readonly string _filePattern = "dataferret_{0}.jsonl";
+
+    public FilePersistence(string basePath = null, long maxTotalBytes = 5L * 1024 * 1024)
+    {
+        _directory = System.IO.Path.Combine(
+            basePath ?? UnityEngine.Application.persistentDataPath,
+            "dataferret"
+        );
+        _maxTotalBytes = maxTotalBytes;
+        EnsureDirectory();
+    }
+
+    // 이벤트 목록을 .jsonl 파일에 append
+    public void Save(IEnumerable<EventEnvelope> events) { ... }
+
+    // 모든 .jsonl 파일을 시간순으로 읽어 이벤트 목록 반환
+    public List<EventEnvelope> LoadAll() { ... }
+
+    // 성공적으로 전송된 파일 삭제
+    public void Delete(string filePath) { ... }
+
+    // 5MB 초과 시 가장 오래된 파일부터 삭제
+    private void EnforceMaxSize() { ... }
+}
+```
+
+**파일 저장 규칙**:
+- 저장 경로: `Application.persistentDataPath + "/dataferret/"`
+- 파일 포맷: JSON Lines (.jsonl) — 한 줄에 EventEnvelope 1건
+- 최대 총 크기: 5MB (초과 시 가장 오래된 파일부터 삭제)
+- 파일 이름: `dataferret_{timestamp}.jsonl` (타임스탬프 기반)
+- `FileStream`에 명시적 `Flush()` 호출 → 쓰기 완료 보장
+- 손상된 파일 (파싱 실패): 해당 줄 스킵 + 경고 로그, 나머지 줄 계속 처리
+
+**오프라인 → 온라인 복구 흐름**:
+```
+Init() 호출
+    │
+    ├─ FilePersistence.LoadAll() 호출
+    │       → 디렉토리 내 모든 .jsonl 파일 시간순 읽기
+    │       → 이벤트 목록 반환
+    │
+    ├─ EventQueue에 로드된 이벤트 merge (Enqueue)
+    │
+    └─ 다음 flush 시 Collector API로 재전송
+            → 성공 시 해당 .jsonl 파일 삭제
+```
+
+### 4.3 WebGLPersistence — PlayerPrefs 폴백
+
+```csharp
+public class WebGLPersistence
+{
+    private const string KeyPrefix = "df_queue_";
+    private const int MaxEntries = 200;  // PlayerPrefs 용량 제한 고려
+
+    // PlayerPrefs에 이벤트 저장 (키: df_queue_{index})
+    public void Save(IEnumerable<EventEnvelope> events) { ... }
+
+    // PlayerPrefs에서 이벤트 로드
+    public List<EventEnvelope> LoadAll() { ... }
+
+    // PlayerPrefs 큐 초기화
+    public void Clear() { ... }
+}
+```
+
+**WebGL 제약 사항**:
+- `Application.persistentDataPath` 미지원 → `PlayerPrefs` 사용
+- 브라우저 종류에 따라 PlayerPrefs 총 용량 약 1MB 제한
+- 엄격한 최대 항목 수 제한 (200건) 적용
+- Phase 2 개선 사항: IndexedDB via `.jslib` 인터롭 (더 큰 용량)
+
+---
+
+## 5. Transport 계층 (C#)
+
+### 5.1 ITransport — 인터페이스
+
+```csharp
+public interface ITransport
+{
+    // 이벤트 배치 전송 (비동기, 코루틴 또는 async/await)
+    IEnumerator SendBatch(
+        List<EventEnvelope> events,
+        System.Action<bool> onComplete   // true = 성공, false = 영구 실패
+    );
+}
+```
+
+### 5.2 UnityWebRequestTransport — 코루틴 기반 HTTP 전송
+
+```csharp
+public class UnityWebRequestTransport : ITransport
+{
+    private readonly string _endpoint;
+    private readonly string _writeKey;
+    private readonly int _timeoutSeconds;
+    private readonly int _maxRetries;
+
+    public IEnumerator SendBatch(List<EventEnvelope> events, System.Action<bool> onComplete)
+    {
+        var payload = BuildPayload(events);
+        var url = $"{_endpoint}/v1/collect/batch";
+
+        for (int attempt = 0; attempt <= _maxRetries; attempt++)
+        {
+            // 지수 백오프: 1s → 2s → 4s
+            if (attempt > 0)
+            {
+                yield return new WaitForSecondsRealtime(Mathf.Pow(2f, attempt - 1));
+            }
+
+            using var request = new UnityWebRequest(url, "POST");
+            var bodyRaw = System.Text.Encoding.UTF8.GetBytes(payload);
+            request.uploadHandler = new UploadHandlerRaw(bodyRaw);
+            request.downloadHandler = new DownloadHandlerBuffer();
+            request.SetRequestHeader("Authorization", $"Bearer {_writeKey}");
+            request.SetRequestHeader("Content-Type", "application/json");
+            request.timeout = _timeoutSeconds;
+
+            yield return request.SendWebRequest();
+
+            // 성공 (2xx)
+            if (request.result == UnityWebRequest.Result.Success)
+            {
+                onComplete?.Invoke(true);
+                yield break;
+            }
+
+            // 영구 실패: 재시도하지 않음
+            if (request.responseCode == 401 || request.responseCode == 413)
+            {
+                UnityEngine.Debug.LogError(
+                    $"[DataFerret] Permanent failure ({request.responseCode}). " +
+                    "Events discarded. Check Write Key.");
+                onComplete?.Invoke(false);
+                yield break;
+            }
+        }
+
+        // maxRetries 소진: FilePersistence에 저장
+        onComplete?.Invoke(false);
+    }
+
+    private string BuildPayload(List<EventEnvelope> events)
+    {
+        var batch = new BatchPayload
+        {
+            batch = events,
+            sentAt = System.DateTime.UtcNow.ToString("o"),
+        };
+        return Newtonsoft.Json.JsonConvert.SerializeObject(batch);
+    }
+}
+```
+
+**주의 사항**:
+- `UnityWebRequest`는 반드시 Unity 메인 스레드에서 호출 (코루틴으로 처리)
+- `request.timeout`은 초 단위 정수 (기본 10초)
+- 401 (인증 실패), 413 (페이로드 초과): 재시도 없이 즉시 discard + 에러 로그
+- 429 (Rate Limit), 5xx (서버 오류): 지수 백오프 재시도
+
+### 5.3 WebGLTransport — JavaScript Bridge
+
+```csharp
+public class WebGLTransport : ITransport
+{
+    public IEnumerator SendBatch(List<EventEnvelope> events, System.Action<bool> onComplete)
+    {
+        var payload = BuildPayload(events);
+        var url = $"{DataFerretAnalytics.Config.ApiHost}/v1/collect/batch";
+
+        bool completed = false;
+        bool success = false;
+
+        WebGLBridge.DataFerret_SendBatch(url, payload, (result) =>
+        {
+            success = result == 1;
+            completed = true;
+        });
+
+        yield return new WaitUntil(() => completed);
+        onComplete?.Invoke(success);
+    }
+}
+```
+
+**DataFerretBridge.jslib — JavaScript 인터롭**:
+
+```javascript
+mergeInto(LibraryManager.library, {
+    DataFerret_SendBatch: function(urlPtr, bodyPtr, callbackPtr) {
+        var url = UTF8ToString(urlPtr);
+        var body = UTF8ToString(bodyPtr);
+
+        fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: body,
+            keepalive: true  // 페이지 unload 후에도 전송 완료 보장
+        }).then(function(response) {
+            // 콜백: 1 = 성공, 0 = 실패
+            dynCall_vi(callbackPtr, response.ok ? 1 : 0);
+        }).catch(function(error) {
+            dynCall_vi(callbackPtr, 0);
+        });
+    },
+
+    DataFerret_SendBeacon: function(urlPtr, bodyPtr) {
+        var url = UTF8ToString(urlPtr);
+        var body = UTF8ToString(bodyPtr);
+        // 페이지 종료 시 최선 노력 전송 (fire-and-forget)
+        navigator.sendBeacon(url, new Blob([body], { type: 'application/json' }));
+    }
+});
+```
+
+**WebGL Transport 설계 원칙**:
+- `UnityWebRequest`는 WebGL에서 백그라운드 전송 불가 → `.jslib` 브릿지 필수
+- `fetch()`의 `keepalive: true` 옵션으로 페이지 이탈 후에도 전송 보장
+- `sendBeacon()`은 앱 종료/페이지 이탈 시 fire-and-forget 전송에 사용
+- CORS: Write Key의 `allowedOrigins`에 WebGL 게임 호스팅 도메인 등록 필요
+
+---
+
+## 6. 자동 수집 (MonoBehaviour Lifecycle)
+
+### 6.1 FlushScheduler — DontDestroyOnLoad 싱글톤
+
+```csharp
+[DisallowMultipleComponent]
+public class FlushScheduler : MonoBehaviour
+{
+    private static FlushScheduler _instance;
+    private float _lastFlushTime;
+
+    void Awake()
+    {
+        // 싱글톤 보장: 중복 인스턴스 즉시 파괴
+        if (_instance != null && _instance != this)
+        {
+            Destroy(gameObject);
+            return;
+        }
+        _instance = this;
+        DontDestroyOnLoad(gameObject);
+    }
+
+    void Update()
+    {
+        // 설정된 flushInterval 경과 시 자동 flush
+        if (Time.realtimeSinceStartup - _lastFlushTime >= DataFerretAnalytics.Config.FlushIntervalSeconds)
+        {
+            _lastFlushTime = Time.realtimeSinceStartup;
+            DataFerretAnalytics.Flush();
+        }
+    }
+
+    void OnApplicationPause(bool isPaused)
+    {
+        if (isPaused)
+        {
+            // 백그라운드 진입 시 즉시 flush (이벤트 유실 방지)
+            DataFerretAnalytics.Flush();
+        }
+    }
+
+    void OnApplicationQuit()
+    {
+        // 앱 종료 시 동기 flush (게임 루프 종료 전에 완료)
+        DataFerretAnalytics.FlushSync();
+    }
+}
+```
+
+**FlushScheduler 동작 규칙**:
+- `Init()` 호출 시 `new GameObject("DataFerretScheduler")`로 생성
+- `DontDestroyOnLoad` 적용 — 씬 전환 후에도 유지
+- `DisallowMultipleComponent` 속성으로 복수 인스턴스 방지
+- `OnApplicationQuit()`: WebGL에서는 JS `sendBeacon` 사용 (async 불가)
+
+### 6.2 SessionTracker — 세션 관리
+
+```csharp
+public class SessionTracker
+{
+    private string _sessionId;
+    private float _sessionStartTime;
+    private float _backgroundStartTime = -1f;
+    private const float SessionTimeoutMinutes = 30f;
+
+    // 세션 시작: Init() 또는 포그라운드 복귀 시
+    public void StartSession()
+    {
+        _sessionId = System.Guid.NewGuid().ToString();
+        _sessionStartTime = Time.realtimeSinceStartup;
+
+        DataFerretAnalytics.Track("session_start", new Dictionary<string, object>
+        {
+            { "session_id", _sessionId },
+            { "is_first_session", IsFirstSession() },
+            { "days_since_install", GetDaysSinceInstall() },
+            { "days_since_last_session", GetDaysSinceLastSession() },
+        });
+    }
+
+    // 세션 종료: 백그라운드 30분 이상 또는 앱 종료 시
+    public void EndSession()
+    {
+        var duration = Time.realtimeSinceStartup - _sessionStartTime;
+        DataFerretAnalytics.Track("session_end", new Dictionary<string, object>
+        {
+            { "session_id", _sessionId },
+            { "duration_seconds", Mathf.RoundToInt(duration) },
+        });
+    }
+
+    // OnApplicationPause에서 호출
+    public void OnPause(bool isPaused)
+    {
+        if (isPaused)
+        {
+            _backgroundStartTime = Time.realtimeSinceStartup;
+            EndSession();
+        }
+        else
+        {
+            // 백그라운드 30분 이상 경과 시 새 세션 시작
+            if (_backgroundStartTime >= 0)
+            {
+                var backgroundDuration = Time.realtimeSinceStartup - _backgroundStartTime;
+                if (backgroundDuration >= SessionTimeoutMinutes * 60f)
+                {
+                    StartSession();
+                }
+                _backgroundStartTime = -1f;
+            }
+        }
+    }
+}
+```
+
+**세션 ID 정책**: GUID, 메모리에만 보관 (앱 재시작 시 항상 새 세션)
+
+### 6.3 SceneTracker — 씬 전환 자동 추적
+
+```csharp
+public class SceneTracker
+{
+    private string _previousSceneName = "";
+
+    public void Initialize()
+    {
+        SceneManager.sceneLoaded += OnSceneLoaded;
+    }
+
+    public void Dispose()
+    {
+        SceneManager.sceneLoaded -= OnSceneLoaded;
+    }
+
+    private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
+    {
+        DataFerretAnalytics.Screen(scene.name, new Dictionary<string, object>
+        {
+            { "previous_scene", _previousSceneName },
+            { "load_mode", mode.ToString() },
+        });
+        _previousSceneName = scene.name;
+    }
+}
+```
+
+### 6.4 LifecycleTracker — 앱 생명주기
+
+```csharp
+public class LifecycleTracker
+{
+    private float _backgroundStartTime = -1f;
+
+    public void OnPause(bool isPaused)
+    {
+        if (isPaused)
+        {
+            _backgroundStartTime = Time.realtimeSinceStartup;
+            DataFerretAnalytics.Track("app_backgrounded", new Dictionary<string, object>
+            {
+                { "session_length", Time.realtimeSinceStartup },
+            });
+        }
+        else
+        {
+            var backgroundDuration = _backgroundStartTime >= 0
+                ? Time.realtimeSinceStartup - _backgroundStartTime
+                : 0f;
+
+            DataFerretAnalytics.Track("app_foregrounded", new Dictionary<string, object>
+            {
+                { "background_duration_seconds", Mathf.RoundToInt(backgroundDuration) },
+            });
+            _backgroundStartTime = -1f;
+        }
+    }
+}
+```
+
+### 6.5 ErrorTracker — 에러 자동 추적
+
+```csharp
+public class ErrorTracker
+{
+    private readonly Dictionary<string, float> _recentErrors = new();
+    private const float DedupWindowSeconds = 60f;
+
+    public void Initialize()
+    {
+        Application.logMessageReceived += OnLogMessage;
+    }
+
+    public void Dispose()
+    {
+        Application.logMessageReceived -= OnLogMessage;
+    }
+
+    private void OnLogMessage(string condition, string stackTrace, LogType type)
+    {
+        // Exception 및 Error 타입만 추적
+        if (type != LogType.Exception && type != LogType.Error) return;
+
+        // 60초 내 동일 메시지 중복 제거
+        if (_recentErrors.TryGetValue(condition, out var lastTime))
+        {
+            if (Time.realtimeSinceStartup - lastTime < DedupWindowSeconds) return;
+        }
+        _recentErrors[condition] = Time.realtimeSinceStartup;
+
+        DataFerretAnalytics.Track("error_occurred", new Dictionary<string, object>
+        {
+            { "message", condition },
+            // stackTrace를 1000자로 절단 (이벤트 크기 제한 대응)
+            { "stack_trace", stackTrace?.Length > 1000
+                ? stackTrace[..1000] + "..."
+                : stackTrace },
+            { "log_type", type.ToString() },
+        });
+    }
+}
+```
+
+### 6.6 PerformanceTracker — 성능 샘플링 (opt-in)
+
+```csharp
+public class PerformanceTracker : MonoBehaviour
+{
+    private const float SampleIntervalSeconds = 30f;
+
+    void Start()
+    {
+        InvokeRepeating(nameof(Sample), SampleIntervalSeconds, SampleIntervalSeconds);
+    }
+
+    void Sample()
+    {
+        DataFerretAnalytics.Track("performance_sample", new Dictionary<string, object>
+        {
+            { "fps", Mathf.RoundToInt(1f / Time.deltaTime) },
+            { "memory_used_mb", System.GC.GetTotalMemory(false) / (1024 * 1024) },
+            { "mono_heap_mb", UnityEngine.Profiling.Profiler.GetMonoHeapSizeLong() / (1024 * 1024) },
+        });
+    }
+}
+```
+
+---
+
+## 7. 플랫폼 추상화
+
+### 7.1 PlatformInfo — SystemInfo 래퍼
+
+```csharp
+public static class PlatformInfo
+{
+    public static string DeviceType =>
+        UnityEngine.SystemInfo.deviceType.ToString();
+
+    public static string DeviceModel =>
+        UnityEngine.SystemInfo.deviceModel;
+
+    public static string GPU =>
+        UnityEngine.SystemInfo.graphicsDeviceName;
+
+    public static string OS =>
+        UnityEngine.SystemInfo.operatingSystem;
+
+    public static string UnityVersion =>
+        UnityEngine.Application.unityVersion;
+
+    public static string Platform =>
+        UnityEngine.Application.platform.ToString();
+
+    public static string Store => DetectStore();
+
+    private static string DetectStore()
+    {
+        switch (UnityEngine.Application.platform)
+        {
+            case RuntimePlatform.Android:      return "google_play";
+            case RuntimePlatform.IPhonePlayer: return "app_store";
+            case RuntimePlatform.WebGLPlayer:  return "web";
+            case RuntimePlatform.WindowsPlayer:
+            case RuntimePlatform.OSXPlayer:
+            case RuntimePlatform.LinuxPlayer:  return "steam"; // 기본값 (향후 개선)
+            default:                           return "unknown";
+        }
+    }
+}
+```
+
+### 7.2 EventContext — Unity 특화 컨텍스트 필드
+
+SDK가 자동으로 구성하는 `context.game` 객체:
+
+```csharp
+// EventBuilder.BuildContext() 내부 구현
+private EventContext BuildContext()
+{
+    return new EventContext
+    {
+        Library = new LibraryContext
+        {
+            Name = "com.dataferret.analytics",
+            Version = "0.1.0",
+        },
+        Device = new DeviceContext
+        {
+            Type = PlatformInfo.DeviceType,
+            Model = PlatformInfo.DeviceModel,
+            Gpu = PlatformInfo.GPU,
+            Os = PlatformInfo.OS,
+        },
+        Game = new GameContext
+        {
+            Engine = "Unity",
+            EngineVersion = PlatformInfo.UnityVersion,
+            AppVersion = UnityEngine.Application.version,
+            BuildNumber = UnityEngine.Application.buildGUID,
+            Platform = PlatformInfo.Platform,
+            Scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name,
+            Store = PlatformInfo.Store,
+        },
+    };
+}
+```
+
+**Collector API가 `context.game`을 받으면**:
+- `game.platform`으로 `deviceType` 결정: Android/iOS → mobile, Windows/macOS/Linux → desktop, WebGL → webgl
+- `device.model`, `device.gpu` 보존
+- `game.store`로 앱 배포 채널 추적 (google_play, app_store, steam, web)
+
+---
+
+## 8. Editor 통합
+
+### 8.1 DataFerretEditorWindow — 설정 창
+
+메뉴: `Window > DataFerret Analytics`
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  DataFerret Analytics SDK  v0.1.0                        │
+│                                                          │
+│  Write Key: [ wk_proj_xxxx__________________ ] [Verify] │
+│  API Host:  [ https://collect.dataferret.io  ]          │
+│                                                          │
+│  ── Auto Capture ──────────────────────────────────      │
+│  [✓] Sessions         세션 시작/종료 자동 추적           │
+│  [✓] Scene Changes    씬 전환 자동 추적 (screen 이벤트)  │
+│  [✓] Errors           Application.logMessageReceived    │
+│  [✓] Lifecycle        포그라운드/백그라운드 이벤트       │
+│  [ ] Performance      FPS/메모리 샘플링 (opt-in, 30s)   │
+│                                                          │
+│  ── Flush Settings ────────────────────────────────      │
+│  Interval: [ 30 ] seconds    Batch Size: [ 20 ] events  │
+│  Max Queue: [ 1000 ] events  Max Retries: [ 3 ]         │
+│  Debug Mode: [ ]                                        │
+│                                                          │
+│  ── Status ─────────────────────────────────────────     │
+│  Queue: 3 events    Last Flush: 12s ago (✓ 20 sent)     │
+│  Connection: Online  Last Error: None                    │
+│                                                          │
+│  [ Test Connection ]  [ Flush Now ]  [ Clear Queue ]    │
+└─────────────────────────────────────────────────────────┘
+```
+
+**기능 상세**:
+- Write Key 입력 필드: `wk_` 접두사 유효성 검증 (실시간), [Verify] 버튼으로 Collector 헬스 체크
+- Auto Capture 토글: 각 기능 개별 활성화/비활성화
+- Flush Settings: 슬라이더 또는 정수 입력 필드
+- Status 패널: 현재 큐 크기, 마지막 flush 시간, 마지막 에러 (에디터 플레이 모드 시 실시간 업데이트)
+- [Test Connection]: test_event 전송 후 응답 표시 (Write Key 유효성 확인)
+- 설정은 `DataFerretConfig` ScriptableObject에 저장
+
+### 8.2 BuildProcessor — 빌드 전 검증
+
+```csharp
+public class BuildProcessor : IPreprocessBuildWithReport
+{
+    public int callbackOrder => 0;
+
+    public void OnPreprocessBuild(BuildReport report)
+    {
+        var config = LoadConfig();
+
+        if (config == null || string.IsNullOrEmpty(config.WriteKey))
+        {
+            // 경고 다이얼로그: Write Key 미설정
+            if (!EditorUtility.DisplayDialog(
+                "DataFerret Analytics",
+                "Write Key가 설정되지 않았습니다. 이벤트가 전송되지 않습니다. " +
+                "Window > DataFerret Analytics에서 설정하세요.",
+                "빌드 계속",
+                "취소"))
+            {
+                throw new BuildFailedException("DataFerret Write Key가 설정되지 않았습니다.");
+            }
+        }
+
+        // Release 빌드 시 Debug 모드 자동 비활성화 (로그 노출 방지)
+        if (report.summary.options.HasFlag(BuildOptions.Development) == false)
+        {
+            if (config != null && config.Debug)
+            {
+                UnityEngine.Debug.LogWarning(
+                    "[DataFerret] Release 빌드에서 Debug 모드가 비활성화됩니다.");
+                config.Debug = false;
+            }
+        }
+    }
+}
+```
+
+---
+
+## 9. GC Allocation 최적화
+
+### 9.1 목표
+
+**Track() 1회 호출당 GC Allocation < 1KB** — Unity Profiler Allocator 측정 기준.
+
+게임 런타임에서 GC 부하가 과도하면 프레임 드롭이 발생한다. SDK는 이벤트 생성 경로에서 불필요한 힙 할당을 최소화해야 한다.
+
+### 9.2 최적화 전략
+
+```csharp
+// 1. EventEnvelope 풀링: 재사용 가능한 객체 풀
+private static readonly Stack<EventEnvelope> _envelopePool = new(capacity: 32);
+
+public static EventEnvelope Rent()
+{
+    return _envelopePool.Count > 0 ? _envelopePool.Pop() : new EventEnvelope();
+}
+
+public static void Return(EventEnvelope envelope)
+{
+    envelope.Reset();
+    _envelopePool.Push(envelope);
+}
+
+// 2. StringBuilder 재사용: JSON 직렬화 경로
+private static readonly StringBuilder _jsonBuffer = new(capacity: 1024);
+
+// 3. LINQ 금지: 핫 패스에서 foreach + for 루프 사용
+// Bad:  events.Where(e => e.Type == "track").ToList()
+// Good: for 루프로 직접 처리
+
+// 4. Dictionary 재사용 패턴 (호출자 책임)
+// DataFerretAnalytics.Track() 내부에서 properties를 복사할 때
+// 기존 Dictionary를 새로 할당하지 않고 내용만 복사
+
+// 5. struct 활용: 내부 중간 결과
+private struct FlushResult
+{
+    public bool Success;
+    public int SentCount;
+    public string ErrorMessage;
+}
+```
+
+### 9.3 측정 방법
+
+```
+Unity 메뉴: Window > Analysis > Profiler
+    → CPU Usage > Calls > DataFerretAnalytics.Track
+    → GC Alloc 컬럼 확인
+
+목표: GC Alloc 열 값 < 1KB (1024 bytes)
+
+EditMode 테스트에서도 측정:
+    var initial = GC.GetTotalMemory(true);
+    DataFerretAnalytics.Track("test_event", props);
+    var allocated = GC.GetTotalMemory(false) - initial;
+    Assert.Less(allocated, 1024, "GC Alloc must be < 1KB per Track() call");
+```
+
+---
+
+## 10. UPM 패키지 설정
+
+### 10.1 package.json
+
+```json
+{
+  "name": "com.dataferret.analytics",
+  "version": "0.1.0",
+  "displayName": "DataFerret Analytics",
+  "description": "Event analytics SDK for Unity games. Track player behavior, sessions, errors, and performance with automatic collection. Integrates with DataFerret platform for AI-powered analysis.",
+  "unity": "2021.3",
+  "unityRelease": "0f1",
+  "documentationUrl": "https://docs.dataferret.io/sdk/unity",
+  "changelogUrl": "https://github.com/dataferret/analytics-unity/blob/main/CHANGELOG.md",
+  "licensesUrl": "https://github.com/dataferret/analytics-unity/blob/main/LICENSE",
+  "dependencies": {
+    "com.unity.nuget.newtonsoft-json": "3.2.1"
+  },
+  "keywords": [
+    "analytics",
+    "events",
+    "tracking",
+    "dataferret",
+    "telemetry",
+    "session",
+    "retention"
+  ],
+  "author": {
+    "name": "CookApps",
+    "email": "sdk@dataferret.io",
+    "url": "https://dataferret.io"
+  },
+  "samples": [
+    {
+      "displayName": "Basic Usage",
+      "description": "Basic event tracking example scene with initialization, identify, track, and screen calls.",
+      "path": "Samples~/BasicUsage"
+    }
+  ]
+}
+```
+
+### 10.2 .asmdef 파일 구성
+
+**Runtime/DataFerret.Analytics.asmdef**:
+```json
+{
+  "name": "DataFerret.Analytics",
+  "rootNamespace": "DataFerret.Analytics",
+  "references": [
+    "com.unity.nuget.newtonsoft-json"
+  ],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}
+```
+
+**Editor/DataFerret.Analytics.Editor.asmdef**:
+```json
+{
+  "name": "DataFerret.Analytics.Editor",
+  "rootNamespace": "DataFerret.Analytics.Editor",
+  "references": ["DataFerret.Analytics"],
+  "includePlatforms": ["Editor"],
+  "excludePlatforms": [],
+  "autoReferenced": false
+}
+```
+
+**Tests/EditMode/DataFerret.Analytics.Tests.EditMode.asmdef**:
+```json
+{
+  "name": "DataFerret.Analytics.Tests.EditMode",
+  "references": [
+    "DataFerret.Analytics",
+    "UnityEngine.TestRunner",
+    "UnityEditor.TestRunner"
+  ],
+  "includePlatforms": ["Editor"],
+  "optionalUnityReferences": ["TestAssemblies"]
+}
+```
+
+**Tests/PlayMode/DataFerret.Analytics.Tests.PlayMode.asmdef**:
+```json
+{
+  "name": "DataFerret.Analytics.Tests.PlayMode",
+  "references": [
+    "DataFerret.Analytics",
+    "UnityEngine.TestRunner"
+  ],
+  "includePlatforms": [],
+  "optionalUnityReferences": ["TestAssemblies"]
+}
+```
+
+### 10.3 설치 방법
+
+**방법 1: UPM Git URL (권장)**
+
+Unity 메뉴: `Window > Package Manager > + > Add package from git URL`
+
+```
+https://github.com/dataferret/analytics-unity.git
+```
+
+특정 버전 고정:
+```
+https://github.com/dataferret/analytics-unity.git#v0.1.0
+```
+
+`Packages/manifest.json` 직접 편집:
+```json
+{
+  "dependencies": {
+    "com.dataferret.analytics": "https://github.com/dataferret/analytics-unity.git#v0.1.0",
+    "com.unity.nuget.newtonsoft-json": "3.2.1"
+  }
+}
+```
+
+**방법 2: OpenUPM CLI**
+
+```bash
+openupm add com.dataferret.analytics
+```
+
+**방법 3: .unitypackage (레거시)**
+
+GitHub Releases에서 `DataFerretAnalytics-v0.1.0.unitypackage` 다운로드 → Assets > Import Package
+
+---
+
+## 11. 파일 목록
+
+| 파일 경로 | 역할 | 비고 |
+|-----------|------|------|
+| `package.json` | UPM 패키지 매니페스트 | 버전, 의존성, 메타데이터 |
+| `README.md` | 설치 및 빠른 시작 가이드 | |
+| `CHANGELOG.md` | 버전별 변경 이력 | |
+| `LICENSE` | MIT 라이선스 | |
+| `Runtime/DataFerret.Analytics.asmdef` | Runtime Assembly Definition | |
+| `Runtime/DataFerretAnalytics.cs` | Static facade (main entry point) | Init, Track, Identify, Screen, Group, Reset, Flush |
+| `Runtime/DataFerretConfig.cs` | 설정 데이터 클래스 | WriteKey, FlushSize, AutoCapture 등 |
+| `Runtime/Core/EventBuilder.cs` | EventEnvelope 생성 | context 자동 수집, UUID v7 |
+| `Runtime/Core/EventEnvelope.cs` | 이벤트 데이터 모델 | eventId, type, userId, properties 등 |
+| `Runtime/Core/EventContext.cs` | 컨텍스트 데이터 모델 | library, device, game 필드 |
+| `Runtime/Core/EventType.cs` | 이벤트 타입 Enum | identify, track, page, screen, group |
+| `Runtime/Core/IdentityManager.cs` | userId, anonymousId 관리 | PlayerPrefs로 anonymousId 영속화 |
+| `Runtime/Queue/EventQueue.cs` | ConcurrentQueue<T> 래퍼 | MaxQueueSize, DequeueBatch |
+| `Runtime/Queue/FilePersistence.cs` | .jsonl 파일 큐 영속화 | 5MB 한도, 손상 파일 복구 |
+| `Runtime/Queue/WebGLPersistence.cs` | PlayerPrefs 기반 큐 | WebGL 전용 폴백 |
+| `Runtime/Transport/ITransport.cs` | Transport 인터페이스 | SendBatch(events, onComplete) |
+| `Runtime/Transport/UnityWebRequestTransport.cs` | 코루틴 기반 HTTP 전송 | 지수 백오프, 타임아웃 |
+| `Runtime/Transport/WebGLTransport.cs` | .jslib 브릿지 호출 | WebGL 전용 |
+| `Runtime/Lifecycle/FlushScheduler.cs` | MonoBehaviour 플러시 스케줄러 | DontDestroyOnLoad, Update 루프 |
+| `Runtime/Lifecycle/SessionTracker.cs` | 세션 시작/종료 추적 | 30분 타임아웃, GUID 세션 ID |
+| `Runtime/Lifecycle/SceneTracker.cs` | 씬 전환 자동 추적 | SceneManager.sceneLoaded |
+| `Runtime/Lifecycle/LifecycleTracker.cs` | 포그라운드/백그라운드 이벤트 | OnApplicationPause |
+| `Runtime/Lifecycle/ErrorTracker.cs` | 에러/예외 자동 추적 | 60초 dedup, 1000자 stackTrace 절단 |
+| `Runtime/Lifecycle/PerformanceTracker.cs` | FPS/메모리 샘플링 (opt-in) | 30초 간격, InvokeRepeating |
+| `Runtime/Platform/PlatformInfo.cs` | SystemInfo 래퍼 | OS, GPU, Platform, Store 감지 |
+| `Runtime/Platform/WebGLBridge.cs` | JS interop 선언 | DllImport 래퍼 |
+| `Runtime/Plugins/WebGL/DataFerretBridge.jslib` | JavaScript 인터롭 | fetch(), sendBeacon() |
+| `Editor/DataFerret.Analytics.Editor.asmdef` | Editor Assembly Definition | Editor 전용 |
+| `Editor/DataFerretEditorWindow.cs` | Unity Editor 설정 창 | Window > DataFerret Analytics |
+| `Editor/BuildProcessor.cs` | 빌드 전 Write Key 검증 | IPreprocessBuildWithReport |
+| `Tests/EditMode/DataFerret.Analytics.Tests.EditMode.asmdef` | EditMode 테스트 Assembly | |
+| `Tests/EditMode/EventBuilderTests.cs` | EventBuilder 단위 테스트 | ~8개 테스트 |
+| `Tests/EditMode/EventQueueTests.cs` | EventQueue 단위 테스트 | ~6개 테스트 |
+| `Tests/EditMode/IdentityManagerTests.cs` | IdentityManager 단위 테스트 | ~5개 테스트 |
+| `Tests/EditMode/PlatformInfoTests.cs` | PlatformInfo 단위 테스트 | ~4개 테스트 |
+| `Tests/EditMode/FilePersistenceTests.cs` | FilePersistence 단위 테스트 | ~5개 테스트 |
+| `Tests/EditMode/ConfigTests.cs` | DataFerretConfig 유효성 테스트 | ~4개 테스트 |
+| `Tests/PlayMode/DataFerret.Analytics.Tests.PlayMode.asmdef` | PlayMode 테스트 Assembly | |
+| `Tests/PlayMode/FlushSchedulerTests.cs` | FlushScheduler PlayMode 테스트 | ~6개 테스트 |
+| `Tests/PlayMode/SessionTrackerTests.cs` | SessionTracker PlayMode 테스트 | ~5개 테스트 |
+| `Tests/PlayMode/SceneTrackerTests.cs` | SceneTracker PlayMode 테스트 | ~3개 테스트 |
+| `Tests/PlayMode/TransportTests.cs` | Transport PlayMode 테스트 | ~6개 테스트 |
+| `Tests/PlayMode/IntegrationTests.cs` | End-to-end 통합 테스트 | ~5개 테스트 |
+| `Samples~/BasicUsage/SampleScene.unity` | 샘플 씬 | |
+| `Samples~/BasicUsage/SampleTracker.cs` | 샘플 MonoBehaviour | Init, Identify, Track 예시 |
+
+**총 파일 수**: 약 42개 (소스 37개 + 설정 5개)
+
+---
+
+## 12. 테스트 계획
+
+### 12.1 EditMode 테스트 (~32개)
+
+EditMode 테스트는 Unity 에디터에서 플레이 모드 없이 실행되므로 빠르고 안정적이다.
+
+**EventBuilderTests.cs (~8개)**:
+```csharp
+// TC-EB-001: track 이벤트 빌드 — type, event, timestamp 필드 정상 생성
+[Test] public void BuildTrack_WithEventName_SetsTypeAndEvent()
+
+// TC-EB-002: identify 이벤트 빌드 — traits 필드 정상 생성
+[Test] public void BuildIdentify_WithTraits_SetsTraitsField()
+
+// TC-EB-003: screen 이벤트 빌드 — name 필드 정상 생성
+[Test] public void BuildScreen_WithScreenName_SetsNameField()
+
+// TC-EB-004: group 이벤트 빌드 — groupId 필드 정상 생성
+[Test] public void BuildGroup_WithGroupId_SetsGroupIdField()
+
+// TC-EB-005: 필수 필드 검증 — eventId, type, timestamp, anonymousId 존재
+[Test] public void BuildTrack_AlwaysHasRequiredFields()
+
+// TC-EB-006: context 자동 수집 — context.library.name 정상 설정
+[Test] public void BuildTrack_ContextLibraryNameIsCorrect()
+
+// TC-EB-007: properties 제한 — 200개 초과 시 경고 + 절단
+[Test] public void BuildTrack_Properties_OverLimit_Truncated()
+
+// TC-EB-008: eventId 포맷 — UUID v7 형식 (타임스탬프 기반)
+[Test] public void BuildTrack_EventId_IsValidUUID()
+```
+
+**EventQueueTests.cs (~6개)**:
+```csharp
+// TC-EQ-001: 정상 Enqueue/Dequeue
+[Test] public void Enqueue_ThenDequeue_ReturnsSameEvent()
+
+// TC-EQ-002: DequeueBatch — batchSize 이하로 정상 반환
+[Test] public void DequeueBatch_ReturnsUpToBatchSize()
+
+// TC-EQ-003: MaxQueueSize 제한 — 초과 시 Count 유지
+[Test] public void Enqueue_OverMaxSize_CountStaysAtMax()
+
+// TC-EQ-004: MaxQueueSize 초과 시 가장 오래된 이벤트 drop
+[Test] public void Enqueue_OverMaxSize_DropsOldest()
+
+// TC-EQ-005: 스레드 안전성 — 병렬 Enqueue 후 Count 정합성
+[Test] public void Enqueue_Concurrent_ThreadSafe()
+
+// TC-EQ-006: 빈 큐에서 DequeueBatch — 빈 목록 반환
+[Test] public void DequeueBatch_EmptyQueue_ReturnsEmpty()
+```
+
+**IdentityManagerTests.cs (~5개)**:
+```csharp
+// TC-IM-001: anonymousId 자동 생성 — GUID 형식
+[Test] public void AnonymousId_OnFirstAccess_IsGeneratedGuid()
+
+// TC-IM-002: anonymousId 영속화 — PlayerPrefs에 저장/로드
+[Test] public void AnonymousId_Persisted_AcrossInstances()
+
+// TC-IM-003: userId Identify 후 정상 저장
+[Test] public void SetUserId_ThenGet_ReturnsSameId()
+
+// TC-IM-004: Reset() 후 userId null, 새 anonymousId 생성
+[Test] public void Reset_ClearsUserId_GeneratesNewAnonymousId()
+
+// TC-IM-005: userId 미설정 시 null 반환
+[Test] public void UserId_BeforeIdentify_IsNull()
+```
+
+**PlatformInfoTests.cs (~4개)**:
+```csharp
+// TC-PI-001: DeviceType 비어있지 않음
+[Test] public void DeviceType_IsNotEmpty()
+
+// TC-PI-002: UnityVersion 형식 검증 — 숫자.숫자.숫자 포함
+[Test] public void UnityVersion_HasExpectedFormat()
+
+// TC-PI-003: Platform 비어있지 않음
+[Test] public void Platform_IsNotEmpty()
+
+// TC-PI-004: Store 반환값 — 예상 값 집합에 포함
+[Test] public void Store_ReturnsKnownValue()
+```
+
+**FilePersistenceTests.cs (~5개)**:
+```csharp
+// TC-FP-001: Save() 후 디렉토리에 .jsonl 파일 생성
+[Test] public void Save_CreatesJsonlFile()
+
+// TC-FP-002: LoadAll() — 저장된 이벤트 복원
+[Test] public void LoadAll_ReturnsStoredEvents()
+
+// TC-FP-003: 5MB 초과 시 가장 오래된 파일 삭제
+[Test] public void Save_OverMaxSize_DeletesOldestFile()
+
+// TC-FP-004: 손상된 .jsonl 줄 스킵 — 나머지 정상 로드
+[Test] public void LoadAll_CorruptedLine_SkipsAndContinues()
+
+// TC-FP-005: 디렉토리 없는 상태에서 Save() — 자동 생성
+[Test] public void Save_DirectoryNotExists_CreatesIt()
+```
+
+**ConfigTests.cs (~4개)**:
+```csharp
+// TC-CF-001: 기본값 검증 — ApiHost, FlushSize 등 기본값 확인
+[Test] public void Config_DefaultValues_AreCorrect()
+
+// TC-CF-002: WriteKey 유효성 — wk_ 접두사 없으면 예외
+[Test] public void Init_MissingWriteKey_ThrowsException()
+
+// TC-CF-003: WriteKey wk_ 접두사 없으면 유효성 검사 실패
+[Test] public void Config_WriteKey_WithoutPrefix_IsInvalid()
+
+// TC-CF-004: AutoCapture 기본값 — Sessions/SceneChanges/Errors/Lifecycle = true
+[Test] public void AutoCapture_DefaultValues_AllEnabledExceptPerformance()
+```
+
+### 12.2 PlayMode 테스트 (~23개)
+
+PlayMode 테스트는 Unity 게임 루프가 실행되는 환경에서 MonoBehaviour를 실제로 테스트한다.
+
+**FlushSchedulerTests.cs (~6개)**:
+```csharp
+// TC-FS-001: flushInterval 경과 후 자동 flush 호출
+[UnityTest] public IEnumerator AutoFlush_OnInterval()
+
+// TC-FS-002: OnApplicationPause(true) 시 즉시 flush 호출
+[UnityTest] public IEnumerator FlushOnPause_WhenPaused()
+
+// TC-FS-003: DontDestroyOnLoad — 씬 전환 후 GameObject 유지
+[UnityTest] public IEnumerator DontDestroyOnLoad_PersistsAcrossScenes()
+
+// TC-FS-004: 싱글톤 — 두 번째 Init() 시 중복 인스턴스 제거
+[UnityTest] public IEnumerator Singleton_DuplicateDestroyed()
+
+// TC-FS-005: FlushSize 초과 시 즉시 flush
+[UnityTest] public IEnumerator FlushSize_ExceedThreshold_TriggersFlush()
+
+// TC-FS-006: OnApplicationQuit() 시 FlushSync 호출
+[UnityTest] public IEnumerator OnQuit_FlushSyncCalled()
+```
+
+**SessionTrackerTests.cs (~5개)**:
+```csharp
+// TC-ST-001: Init() 직후 session_start 이벤트 발행
+[UnityTest] public IEnumerator SessionStart_FiredOnInit()
+
+// TC-ST-002: OnApplicationPause(true) 시 session_end 이벤트 발행
+[UnityTest] public IEnumerator SessionEnd_FiredOnPause()
+
+// TC-ST-003: 30분 이상 백그라운드 후 포그라운드 복귀 시 새 session_start
+[UnityTest] public IEnumerator NewSession_AfterLongBackground()
+
+// TC-ST-004: 30분 미만 백그라운드 후 포그라운드 복귀 시 session_start 미발행
+[UnityTest] public IEnumerator SameSession_AfterShortBackground()
+
+// TC-ST-005: session_id가 GUID 형식
+[UnityTest] public IEnumerator SessionId_IsValidGuid()
+```
+
+**SceneTrackerTests.cs (~3개)**:
+```csharp
+// TC-SCT-001: 씬 로드 시 screen 이벤트 발행
+[UnityTest] public IEnumerator SceneLoad_FiresScreenEvent()
+
+// TC-SCT-002: screen 이벤트에 previous_scene 포함
+[UnityTest] public IEnumerator SceneLoad_IncludesPreviousScene()
+
+// TC-SCT-003: autoCapture.SceneChanges = false 시 이벤트 미발행
+[UnityTest] public IEnumerator SceneLoad_WhenDisabled_NoEvent()
+```
+
+**TransportTests.cs (~6개)**:
+```csharp
+// TC-TR-001: 정상 전송 성공 — 200 OK 응답 시 onComplete(true)
+[UnityTest] public IEnumerator Send_Success_OnCompleteTrue()
+
+// TC-TR-002: 5xx 에러 → 재시도 → 성공
+[UnityTest] public IEnumerator Send_RetryOnServerError_EventuallySuceds()
+
+// TC-TR-003: 타임아웃 → 재시도 소진 → onComplete(false)
+[UnityTest] public IEnumerator Send_Timeout_MaxRetries_OnCompleteFalse()
+
+// TC-TR-004: 401 응답 → 재시도 없이 즉시 onComplete(false)
+[UnityTest] public IEnumerator Send_401_NoPermanentFailure()
+
+// TC-TR-005: 413 응답 → 재시도 없이 즉시 onComplete(false)
+[UnityTest] public IEnumerator Send_413_NoRetry()
+
+// TC-TR-006: WebGL 환경 — jslib 브릿지 호출
+[UnityTest] public IEnumerator WebGL_Bridge_Called()
+```
+
+**IntegrationTests.cs (~5개)**:
+```csharp
+// TC-IT-001: Init() → Track() 여러 건 → Flush() → Transport 호출 완료
+[UnityTest] public IEnumerator FullFlow_InitTrackFlush_SendsEvents()
+
+// TC-IT-002: 오프라인 큐 — 전송 실패 시 .jsonl 저장, 다음 Init() 시 재전송
+[UnityTest] public IEnumerator OfflinePersistence_FailureSaved_RetriedOnNextInit()
+
+// TC-IT-003: Identify → Track — userId가 이후 이벤트에 포함
+[UnityTest] public IEnumerator Identify_ThenTrack_UserIdPresent()
+
+// TC-IT-004: Reset() → Track — userId null, 새 anonymousId
+[UnityTest] public IEnumerator Reset_ThenTrack_NoUserId()
+
+// TC-IT-005: GC Alloc 검증 — Track() 1회 호출 < 1KB
+[UnityTest] public IEnumerator Track_GCAlloc_LessThan1KB()
+```
+
+### 12.3 테스트 실행 방법
+
+```
+Unity 메뉴: Window > General > Test Runner
+    │
+    ├─ EditMode 탭 → Run All (빠름, 에디터 전용)
+    └─ PlayMode 탭 → Run All (느림, 게임 루프 필요)
+
+CI 환경 (GitHub Actions + GameCI):
+    - unity-builder 액션으로 EditMode 테스트 자동 실행
+    - PlayMode 테스트는 headless Unity 실행
+    - 결과: JUnit XML 포맷 → GitHub Actions 테스트 리포트
+```
+
+**총 예상 테스트 수**: EditMode 32개 + PlayMode 23개 = **55개**
+
+---
+
+## 13. 구현 순서
+
+Phase 1 Sprint 3B — 3주 구현 일정:
+
+### Week 1: 코어 + 큐 (기반 구축)
+
+| 순서 | 작업 | 산출물 |
+|------|------|--------|
+| 1 | UPM 패키지 뼈대 | `package.json`, 4개 `.asmdef`, 디렉토리 구조 생성 |
+| 2 | 데이터 클래스 | `EventEnvelope.cs`, `EventContext.cs`, `EventType.cs` |
+| 3 | EventBuilder + 테스트 | `EventBuilder.cs` + `EventBuilderTests.cs` (8개) |
+| 4 | IdentityManager + 테스트 | `IdentityManager.cs` + `IdentityManagerTests.cs` (5개) |
+| 5 | PlatformInfo + 테스트 | `PlatformInfo.cs` + `PlatformInfoTests.cs` (4개) |
+| 6 | DataFerretConfig + 테스트 | `DataFerretConfig.cs` + `ConfigTests.cs` (4개) |
+| 7 | EventQueue + 테스트 | `EventQueue.cs` + `EventQueueTests.cs` (6개) |
+| 8 | FilePersistence + 테스트 | `FilePersistence.cs` + `FilePersistenceTests.cs` (5개) |
+| 9 | WebGLPersistence + 테스트 | `WebGLPersistence.cs` + EditMode 테스트 (3개) |
+
+**Week 1 완료 기준**: EditMode 테스트 32개 전부 GREEN
+
+### Week 2: Transport + 자동 수집
+
+| 순서 | 작업 | 산출물 |
+|------|------|--------|
+| 10 | ITransport 인터페이스 | `ITransport.cs` |
+| 11 | UnityWebRequestTransport + 테스트 | `UnityWebRequestTransport.cs` + `TransportTests.cs` (6개) |
+| 12 | WebGLTransport + .jslib | `WebGLTransport.cs`, `WebGLBridge.cs`, `DataFerretBridge.jslib` |
+| 13 | FlushScheduler + 테스트 | `FlushScheduler.cs` + `FlushSchedulerTests.cs` (6개) |
+| 14 | SessionTracker + 테스트 | `SessionTracker.cs` + `SessionTrackerTests.cs` (5개) |
+| 15 | SceneTracker + 테스트 | `SceneTracker.cs` + `SceneTrackerTests.cs` (3개) |
+| 16 | LifecycleTracker | `LifecycleTracker.cs` |
+| 17 | ErrorTracker | `ErrorTracker.cs` |
+| 18 | PerformanceTracker (opt-in) | `PerformanceTracker.cs` |
+
+**Week 2 완료 기준**: PlayMode 테스트 23개 중 20개 GREEN (TransportTests WebGL 2개는 Week 3)
+
+### Week 3: Static Facade + Editor + 패키지 완성
+
+| 순서 | 작업 | 산출물 |
+|------|------|--------|
+| 19 | DataFerretAnalytics static facade + 통합 테스트 | `DataFerretAnalytics.cs` + `IntegrationTests.cs` (5개) |
+| 20 | DataFerretEditorWindow | `DataFerretEditorWindow.cs` (Test Connection, 상태 표시) |
+| 21 | BuildProcessor | `BuildProcessor.cs` (Write Key 검증, Release Debug 비활성화) |
+| 22 | 샘플 씬 | `SampleScene.unity`, `SampleTracker.cs` |
+| 23 | GC Allocation 프로파일링 검증 | Unity Profiler로 < 1KB 확인, 최적화 |
+| 24 | OpenUPM 등록 준비 | `openupm.json`, CI 빌드/배포 파이프라인 설정 |
+
+**Week 3 완료 기준**:
+- 전체 55개 테스트 GREEN
+- Android + iOS + WebGL + PC 빌드에서 이벤트 전송 검증
+- GC Alloc < 1KB/Track() 확인
+
+---
+
+## 14. 보안 고려사항
+
+| 항목 | 대응 방법 |
+|------|-----------|
+| **Write Key 바이너리 노출** | Write Key는 쓰기 전용 (읽기/관리 API 접근 불가). 노출되어도 데이터 수집만 가능. 중요 이벤트(결제)는 반드시 Server SDK로 이중 검증 권장 |
+| **HTTPS 강제** | `ApiHost`가 `http://`로 시작하면 Init() 시 예외 또는 경고. 모든 전송은 HTTPS |
+| **PII 자동 수집 없음** | SDK가 유저 PII를 자동 수집하지 않음. Identify()의 traits는 게임 스튜디오가 직접 선택. 개인정보처리방침에서 명시 필요 |
+| **WebGL CORS** | Unity WebGL 빌드는 브라우저 환경이므로 CORS 적용. Write Key 생성 시 `allowedOrigins`에 게임 호스팅 도메인 등록 필요 |
+| **IL2CPP Stripping** | Newtonsoft.Json 타입이 IL2CPP 스트리핑으로 제거될 수 있음. `link.xml` 파일로 보존 대상 명시 필요 |
+| **PlayerPrefs 평문 저장** | anonymousId, WebGL 큐가 PlayerPrefs에 평문 저장됨. 민감 정보 아님 (익명 ID, 이벤트 내용). 필요 시 AES 암호화 옵션 추가 가능 (Phase 2) |
+| **에러 추적 및 PII** | ErrorTracker가 stackTrace를 수집함. stackTrace에 PII가 포함될 수 있으므로 1000자 절단 및 필터링 옵션 고려 |
+| **빌드 환경 분리** | BuildProcessor가 Release 빌드에서 `Debug = false` 강제 적용 → 로그를 통한 SDK 내부 정보 노출 방지 |
+
+**link.xml 예시** (IL2CPP Stripping 방지):
+```xml
+<linker>
+  <assembly fullname="Newtonsoft.Json" preserve="all" />
+  <assembly fullname="DataFerret.Analytics" preserve="all" />
+</linker>
+```
+
+---
+
+## 15. 완료 기준
+
+Sprint 3B가 완료되려면 아래 조건을 모두 충족해야 한다:
+
+### 15.1 기능 완료 기준
+
+| 항목 | 검증 방법 |
+|------|-----------|
+| Android/iOS 빌드에서 Track() → Collector API 이벤트 수신 | 실기기 빌드 또는 Unity Cloud Build 검증 |
+| WebGL 빌드에서 fetch()/sendBeacon()으로 이벤트 전송 | 브라우저에서 WebGL 빌드 실행 + Network 탭 확인 |
+| Windows/macOS PC 빌드에서 이벤트 전송 | 로컬 빌드 실행 검증 |
+| UPM Git URL로 새 Unity 프로젝트에 설치 후 동작 | 별도 Unity 프로젝트에서 Git URL 설치 테스트 |
+| Editor Window에서 Write Key 입력 + Test Connection 성공 | 에디터에서 직접 확인 |
+| 오프라인 큐: 전송 실패 → .jsonl 저장 → 다음 Init() 시 재전송 | PlayMode 통합 테스트 TC-IT-002 |
+| WebGL: PlayerPrefs 큐 저장/복원 | WebGL 빌드 수동 검증 |
+
+### 15.2 품질 완료 기준
+
+| 항목 | 기준 |
+|------|------|
+| EditMode 테스트 | 32개 전부 PASS |
+| PlayMode 테스트 | 23개 전부 PASS |
+| 총 테스트 수 | 55개 이상 |
+| GC Allocation per Track() | < 1KB (Unity Profiler 측정) |
+| 코드 리뷰 | PR 리뷰 승인 1명 이상 |
+
+### 15.3 배포 준비 기준
+
+| 항목 | 기준 |
+|------|------|
+| UPM 패키지 완성도 | package.json, README, CHANGELOG, 샘플 씬 포함 |
+| OpenUPM 레지스트리 등록 준비 | `openupm.json` 설정, GitHub 레포지토리 공개 설정 |
+| .unitypackage 빌드 | GitHub Releases에 배포 준비 |
+| Sprint 1-5 연동 준비 | SDK 설치 가이드 페이지용 C# 코드 스니펫, UPM 설치 방법 제공 |
+
+### 15.4 Phase 1 전체 완료 기준 중 본 스프린트 담당
+
+`docs/plans/data-pipeline/009_implementation_roadmap.md` §2.3에서:
+- [x] Unity SDK (UPM) 설치 → 이벤트 전송 → PostgreSQL 버퍼 → S3 Parquet → AI Chat 쿼리 가능
+- [x] Unity SDK Android/iOS/WebGL 빌드에서 이벤트 전송 검증 완료
+- [x] 신규 Unity SDK 테스트 수 50개 이상 (EditMode + PlayMode)
+- [x] Unity SDK GC Allocation per Track() < 1KB
+
+---
+
+## 부록 A. Collector API 연동 스펙
+
+Unity SDK가 호출하는 엔드포인트:
+
+**POST /v1/collect/batch**
+
+```
+Authorization: Bearer wk_proj_abc123
+Content-Type: application/json
+
+{
+  "batch": [
+    {
+      "eventId": "01905abc-def0-7123-8456-789abcdef012",
+      "type": "track",
+      "event": "stage_cleared",
+      "userId": "user_123",
+      "anonymousId": "anon_456",
+      "properties": {
+        "stage_id": 42,
+        "time_spent": 125.3,
+        "stars": 3
+      },
+      "timestamp": "2026-03-04T09:30:00.000Z",
+      "context": {
+        "library": {
+          "name": "com.dataferret.analytics",
+          "version": "0.1.0"
+        },
+        "device": {
+          "type": "mobile",
+          "model": "Samsung Galaxy S21",
+          "gpu": "Adreno 660",
+          "os": "Android 13"
+        },
+        "game": {
+          "engine": "Unity",
+          "engineVersion": "2022.3.20f1",
+          "appVersion": "1.2.0",
+          "platform": "Android",
+          "scene": "Stage_42",
+          "store": "google_play"
+        }
+      }
+    }
+  ],
+  "sentAt": "2026-03-04T09:30:01.000Z"
+}
+```
+
+**성공 응답 (202 Accepted)**:
+```json
+{ "accepted": 1, "rejected": 0, "errors": [] }
+```
+
+**제한 사항**:
+- 배치 최대 500건 또는 4MB
+- 단건 최대 32KB
+- properties 키 최대 200개
+- Rate Limit: 100req/10s (IP), 1000req/min (API Key)
+
+---
+
+## 부록 B. EventEnvelope C# 데이터 클래스
+
+```csharp
+[System.Serializable]
+public class EventEnvelope
+{
+    // === 필수 ===
+    [Newtonsoft.Json.JsonProperty("eventId")]
+    public string EventId;                         // UUID v7
+
+    [Newtonsoft.Json.JsonProperty("type")]
+    public string Type;                            // "identify" | "track" | "page" | "screen" | "group"
+
+    [Newtonsoft.Json.JsonProperty("timestamp")]
+    public string Timestamp;                       // ISO 8601 (UTC)
+
+    // === 식별자 ===
+    [Newtonsoft.Json.JsonProperty("anonymousId")]
+    public string AnonymousId;                     // 항상 존재
+
+    [Newtonsoft.Json.JsonProperty("userId", NullValueHandling = Newtonsoft.Json.NullValueHandling.Ignore)]
+    public string UserId;                          // null 허용
+
+    // === 이벤트별 데이터 ===
+    [Newtonsoft.Json.JsonProperty("event", NullValueHandling = Newtonsoft.Json.NullValueHandling.Ignore)]
+    public string Event;                           // track 타입 시 이벤트 이름
+
+    [Newtonsoft.Json.JsonProperty("properties", NullValueHandling = Newtonsoft.Json.NullValueHandling.Ignore)]
+    public Dictionary<string, object> Properties;
+
+    [Newtonsoft.Json.JsonProperty("traits", NullValueHandling = Newtonsoft.Json.NullValueHandling.Ignore)]
+    public Dictionary<string, object> Traits;
+
+    [Newtonsoft.Json.JsonProperty("name", NullValueHandling = Newtonsoft.Json.NullValueHandling.Ignore)]
+    public string Name;                            // page/screen 타입 시 이름
+
+    [Newtonsoft.Json.JsonProperty("groupId", NullValueHandling = Newtonsoft.Json.NullValueHandling.Ignore)]
+    public string GroupId;
+
+    // === 자동 수집 컨텍스트 ===
+    [Newtonsoft.Json.JsonProperty("context")]
+    public EventContext Context;
+
+    // === SDK 전송 시간 ===
+    [Newtonsoft.Json.JsonProperty("sentAt", NullValueHandling = Newtonsoft.Json.NullValueHandling.Ignore)]
+    public string SentAt;
+
+    public void Reset()
+    {
+        EventId = null; Type = null; Timestamp = null;
+        AnonymousId = null; UserId = null; Event = null;
+        Properties = null; Traits = null; Name = null;
+        GroupId = null; Context = null; SentAt = null;
+    }
+}
+```
+
+---
+
+## 부록 C. Samples~/BasicUsage/SampleTracker.cs
+
+```csharp
+using UnityEngine;
+using DataFerret.Analytics;
+using System.Collections.Generic;
+
+/// <summary>
+/// DataFerret Analytics SDK 기본 사용 예시
+/// MonoBehaviour에 Attach하여 게임 오브젝트에 추가하세요.
+/// </summary>
+public class SampleTracker : MonoBehaviour
+{
+    [Header("DataFerret 설정")]
+    [SerializeField] private string writeKey = "wk_proj_YOUR_KEY_HERE";
+
+    void Awake()
+    {
+        // SDK 초기화 (게임 시작 시 한 번만 호출)
+        DataFerretAnalytics.Init(new DataFerretConfig
+        {
+            WriteKey = writeKey,
+            Debug = true,  // 개발 중: 콘솔 로그 활성화
+            AutoCapture = new DataFerretConfig.AutoCaptureConfig
+            {
+                Sessions = true,
+                SceneChanges = true,
+                Errors = true,
+                Lifecycle = true,
+            },
+        });
+
+        // 글로벌 프로퍼티: 모든 이벤트에 자동 추가
+        DataFerretAnalytics.SetGlobalProperties(new Dictionary<string, object>
+        {
+            { "app_version", Application.version },
+        });
+
+        Debug.Log("[Sample] DataFerret Analytics initialized");
+    }
+
+    // 버튼 클릭 시 호출
+    public void OnPlayButtonClicked()
+    {
+        DataFerretAnalytics.Track("play_button_clicked", new Dictionary<string, object>
+        {
+            { "source", "main_menu" },
+        });
+    }
+
+    // 스테이지 클리어 시 호출
+    public void OnStageClear(int stageId, int stars, float timeSpent)
+    {
+        DataFerretAnalytics.Track("stage_cleared", new Dictionary<string, object>
+        {
+            { "stage_id", stageId },
+            { "stars", stars },
+            { "time_spent", timeSpent },
+        });
+    }
+
+    // 로그인 성공 시 호출
+    public void OnLoginSuccess(string userId, int playerLevel)
+    {
+        DataFerretAnalytics.Identify(userId, new Dictionary<string, object>
+        {
+            { "level", playerLevel },
+        });
+    }
+
+    // 로그아웃 시 호출
+    public void OnLogout()
+    {
+        DataFerretAnalytics.Reset();
+    }
+}
+```

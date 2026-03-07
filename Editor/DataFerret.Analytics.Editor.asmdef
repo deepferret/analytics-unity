@@ -1,0 +1,18 @@
+{
+  "name": "DataFerret.Analytics.Editor",
+  "rootNamespace": "DataFerret.Analytics.Editor",
+  "references": [
+    "DataFerret.Analytics"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": false,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}

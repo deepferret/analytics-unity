@@ -1,0 +1,16 @@
+{
+  "name": "DataFerret.Analytics",
+  "rootNamespace": "DataFerret.Analytics",
+  "references": [
+    "com.unity.nuget.newtonsoft-json"
+  ],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}
