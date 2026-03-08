@@ -1,0 +1,7 @@
+<linker>
+  <!-- Preserve Newtonsoft.Json for IL2CPP builds -->
+  <assembly fullname="Newtonsoft.Json" preserve="all" />
+
+  <!-- Preserve DataFerret SDK -->
+  <assembly fullname="DataFerret.Analytics" preserve="all" />
+</linker>

@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate package.json
+        run: |
+          jq empty package.json
+          echo "package.json is valid JSON"
+
+      - name: Check required files exist
+        run: |
+          for f in package.json README.md CHANGELOG.md LICENSE Runtime/link.xml; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Missing required file: $f"
+              exit 1
+            fi
+          done
+          echo "All required files present"
+
+      - name: Validate asmdef references
+        run: |
+          for f in $(find . -name "*.asmdef" -not -path "./.git/*"); do
+            jq empty "$f" || { echo "::error::Invalid asmdef: $f"; exit 1; }
+          done
+          echo "All asmdef files are valid JSON"

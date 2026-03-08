@@ -15,6 +15,7 @@
 ### Task 1: Create directory structure
 
 **Files:**
+
 - Create: `packages/sdk-unity/com.dataferret.analytics/Runtime/Core/.gitkeep`
 - Create: `packages/sdk-unity/com.dataferret.analytics/Runtime/Queue/.gitkeep`
 - Create: `packages/sdk-unity/com.dataferret.analytics/Runtime/Transport/.gitkeep`
@@ -63,6 +64,7 @@ Expected: 10 `.gitkeep` files across the directory tree.
 ### Task 2: Create package.json
 
 **Files:**
+
 - Create: `packages/sdk-unity/com.dataferret.analytics/package.json`
 
 **Step 1: Write package.json**
@@ -93,7 +95,7 @@ PRD Section 10.1 spec:
     "retention"
   ],
   "author": {
-    "name": "CookApps",
+    "name": "DeepFerret",
     "email": "sdk@dataferret.io",
     "url": "https://dataferret.io"
   },
@@ -120,6 +122,7 @@ Expected: `Valid JSON`
 ### Task 3: Create Assembly Definition files
 
 **Files:**
+
 - Create: `packages/sdk-unity/com.dataferret.analytics/Runtime/DataFerret.Analytics.asmdef`
 - Create: `packages/sdk-unity/com.dataferret.analytics/Editor/DataFerret.Analytics.Editor.asmdef`
 - Create: `packages/sdk-unity/com.dataferret.analytics/Tests/EditMode/DataFerret.Analytics.Tests.EditMode.asmdef`
@@ -131,9 +134,7 @@ Expected: `Valid JSON`
 {
   "name": "DataFerret.Analytics",
   "rootNamespace": "DataFerret.Analytics",
-  "references": [
-    "com.unity.nuget.newtonsoft-json"
-  ],
+  "references": ["com.unity.nuget.newtonsoft-json"],
   "includePlatforms": [],
   "excludePlatforms": [],
   "allowUnsafeCode": false,
@@ -152,12 +153,8 @@ Expected: `Valid JSON`
 {
   "name": "DataFerret.Analytics.Editor",
   "rootNamespace": "DataFerret.Analytics.Editor",
-  "references": [
-    "DataFerret.Analytics"
-  ],
-  "includePlatforms": [
-    "Editor"
-  ],
+  "references": ["DataFerret.Analytics"],
+  "includePlatforms": ["Editor"],
   "excludePlatforms": [],
   "allowUnsafeCode": false,
   "overrideReferences": false,
@@ -180,24 +177,16 @@ Expected: `Valid JSON`
     "UnityEngine.TestRunner",
     "UnityEditor.TestRunner"
   ],
-  "includePlatforms": [
-    "Editor"
-  ],
+  "includePlatforms": ["Editor"],
   "excludePlatforms": [],
   "allowUnsafeCode": false,
   "overrideReferences": true,
-  "precompiledReferences": [
-    "nunit.framework.dll"
-  ],
+  "precompiledReferences": ["nunit.framework.dll"],
   "autoReferenced": false,
-  "defineConstraints": [
-    "UNITY_INCLUDE_TESTS"
-  ],
+  "defineConstraints": ["UNITY_INCLUDE_TESTS"],
   "versionDefines": [],
   "noEngineReferences": false,
-  "optionalUnityReferences": [
-    "TestAssemblies"
-  ]
+  "optionalUnityReferences": ["TestAssemblies"]
 }
 ```
 
@@ -216,18 +205,12 @@ Expected: `Valid JSON`
   "excludePlatforms": [],
   "allowUnsafeCode": false,
   "overrideReferences": true,
-  "precompiledReferences": [
-    "nunit.framework.dll"
-  ],
+  "precompiledReferences": ["nunit.framework.dll"],
   "autoReferenced": false,
-  "defineConstraints": [
-    "UNITY_INCLUDE_TESTS"
-  ],
+  "defineConstraints": ["UNITY_INCLUDE_TESTS"],
   "versionDefines": [],
   "noEngineReferences": false,
-  "optionalUnityReferences": [
-    "TestAssemblies"
-  ]
+  "optionalUnityReferences": ["TestAssemblies"]
 }
 ```
 
@@ -246,6 +229,7 @@ Expected: 4x `OK`
 ### Task 4: Create README.md
 
 **Files:**
+
 - Create: `packages/sdk-unity/com.dataferret.analytics/README.md`
 
 **Step 1: Write README**
@@ -257,6 +241,7 @@ Include: package description, installation methods (Git URL, OpenUPM, .unitypack
 ### Task 5: Create CHANGELOG.md and LICENSE
 
 **Files:**
+
 - Create: `packages/sdk-unity/com.dataferret.analytics/CHANGELOG.md`
 - Create: `packages/sdk-unity/com.dataferret.analytics/LICENSE`
 
@@ -266,7 +251,7 @@ Keep a Changelog format, initial `[0.1.0] - Unreleased` entry with "Initial pack
 
 **Step 2: Write LICENSE**
 
-MIT license, copyright CookApps.
+MIT license, copyright DeepFerret.
 
 ---
 
@@ -279,6 +264,7 @@ find packages/sdk-unity -type f | sort
 ```
 
 Expected files (15 total):
+
 - 10 `.gitkeep`
 - `package.json`
 - 4 `.asmdef`

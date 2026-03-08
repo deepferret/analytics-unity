@@ -1,0 +1,14 @@
+{
+  "name": "com.dataferret.analytics",
+  "displayName": "DataFerret Analytics",
+  "description": "Event analytics SDK for Unity games",
+  "repoUrl": "https://github.com/dataferret/analytics-unity",
+  "parentRepoUrl": null,
+  "licenseSpdxId": "MIT",
+  "licenseName": "MIT License",
+  "topics": ["analytics", "events", "tracking", "telemetry"],
+  "hunter": "dataferret-bot",
+  "gitTagPrefix": "v",
+  "gitTagIgnore": "",
+  "minVersion": "0.1.0"
+}

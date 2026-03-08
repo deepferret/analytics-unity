@@ -4,7 +4,8 @@
   "references": [
     "DataFerret.Analytics",
     "UnityEngine.TestRunner",
-    "UnityEditor.TestRunner"
+    "UnityEditor.TestRunner",
+    "com.unity.nuget.newtonsoft-json"
   ],
   "includePlatforms": [
     "Editor"
